@@ -82,6 +82,7 @@ public class MemoryAnalyzerCli {
         commands.put("report", new ReportCommand());
         commands.put("gc", new GcCommand());
         commands.put("watch", new WatchCommand());
+        commands.put("debug", new DebugCommand());
         commands.put("exit", new ExitCommand());
         commands.put("quit", new ExitCommand());
     }
@@ -184,6 +185,7 @@ public class MemoryAnalyzerCli {
         System.out.printf("  %-15s %s%n", "gc", "显示 GC 统计");
         System.out.printf("  %-15s %s%n", "watch", "实时监控内存");
         System.out.printf("  %-15s %s%n", "report", "生成报告");
+        System.out.printf("  %-15s %s%n", "debug", "调试模式（生成测试数据）");
         System.out.printf("  %-15s %s%n", "help", "显示帮助");
         System.out.printf("  %-15s %s%n", "exit/quit", "退出程序");
         System.out.println();
@@ -403,11 +405,6 @@ public class MemoryAnalyzerCli {
         public String getDescription() { return "显示类直方图"; }
         public String getUsage() { return "histogram [limit]"; }
         public void execute(String[] args) {
-            if (!attached || heapAnalyzer == null) {
-                System.err.println("未附着到任何进程。");
-                return;
-            }
-
             int limit = 20;
             if (args.length > 0) {
                 try {
@@ -415,6 +412,29 @@ public class MemoryAnalyzerCli {
                 } catch (NumberFormatException e) {
                     // Use default
                 }
+            }
+
+            // Try to get stats from InstrumentedAllocationRecorder first
+            try {
+                Class<?> recorderClass = Class.forName("com.jvm.analyzer.heap.InstrumentedAllocationRecorder");
+                Object instance = recorderClass.getMethod("getInstance").invoke(null);
+                Object statsObj = recorderClass.getMethod("getClassStats").invoke(instance);
+
+                if (statsObj instanceof java.util.Map) {
+                    Map<String, Object> stats = (Map<String, Object>) statsObj;
+                    if (!stats.isEmpty()) {
+                        printInstrumentedHistogram(stats, limit);
+                        return;
+                    }
+                }
+            } catch (Exception e) {
+                // Fall through to original implementation
+            }
+
+            // Original implementation for local HeapAnalyzer
+            if (!attached || heapAnalyzer == null) {
+                System.err.println("未附着到任何进程。请使用 'attach <pid>' 或先用 javaagent 启动。");
+                return;
             }
 
             Map<String, ObjectTracker.ClassInfo> stats =
@@ -435,6 +455,50 @@ public class MemoryAnalyzerCli {
                     : info.className;
                 System.out.printf("%-6d %-50s %15d %15d %15d%n",
                     i + 1, className, info.instanceCount, info.totalSize, info.avgSize);
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        private void printInstrumentedHistogram(Map<String, Object> stats, int limit) {
+            List sorted = new ArrayList<>(stats.entrySet());
+            sorted.sort((a, b) -> {
+                try {
+                    java.util.Map.Entry aa = (java.util.Map.Entry) a;
+                    java.util.Map.Entry bb = (java.util.Map.Entry) b;
+                    Object statsObjA = aa.getValue();
+                    Object statsObjB = bb.getValue();
+                    long sizeA = (Long) statsObjA.getClass().getField("totalSize").get(statsObjA);
+                    long sizeB = (Long) statsObjB.getClass().getField("totalSize").get(statsObjB);
+                    return Long.compare(sizeB, sizeA); // Descending order
+                } catch (Exception ex) {
+                    return 0;
+                }
+            });
+
+            System.out.printf("%-6s %-50s %15s %15s %15s%n",
+                "#", "类名", "实例数", "总大小", "平均大小");
+            System.out.println(new String(new char[110]).replace('\0', '-'));
+
+            int count = Math.min(limit, sorted.size());
+            for (int i = 0; i < count; i++) {
+                try {
+                    java.util.Map.Entry entry = (java.util.Map.Entry) sorted.get(i);
+                    Object statsObj = entry.getValue();
+                    Long instanceCountObj = (Long) statsObj.getClass().getField("instanceCount").get(statsObj);
+                    Long totalSizeObj = (Long) statsObj.getClass().getField("totalSize").get(statsObj);
+                    long instanceCount = instanceCountObj != null ? instanceCountObj : 0L;
+                    long totalSize = totalSizeObj != null ? totalSizeObj : 0L;
+                    long avgSize = instanceCount > 0 ? totalSize / instanceCount : 0;
+
+                    String className = (String) entry.getKey();
+                    String displayClassName = className.length() > 48
+                        ? "..." + className.substring(className.length() - 45)
+                        : className;
+                    System.out.printf("%-6d %-50s %15d %15d %15d%n",
+                        i + 1, displayClassName, instanceCount, totalSize, avgSize);
+                } catch (Exception ex) {
+                    // Ignore
+                }
             }
         }
     }
@@ -591,6 +655,108 @@ public class MemoryAnalyzerCli {
         public void execute(String[] args) {
             running.set(false);
             System.out.println("再见!");
+        }
+    }
+
+    private class DebugCommand implements Command {
+        public String getName() { return "debug"; }
+        public String getDescription() { return "调试模式（生成测试数据）"; }
+        public String getUsage() { return "debug <add-data|clear|stats>"; }
+        public void execute(String[] args) {
+            if (!attached || heapAnalyzer == null) {
+                System.err.println("未附着到任何进程。请先使用 'attach <pid>'。");
+                return;
+            }
+
+            if (args.length < 1) {
+                System.out.println("用法：debug <add-data|clear|stats>");
+                System.out.println();
+                System.out.println("  add-data  - 添加模拟的分配数据（用于测试 histogram）");
+                System.out.println("  clear     - 清除所有跟踪数据");
+                System.out.println("  stats     - 显示内部统计信息");
+                return;
+            }
+
+            String action = args[0].toLowerCase();
+            switch (action) {
+                case "add-data":
+                    System.out.println("正在生成模拟分配数据...");
+                    addMockData();
+                    System.out.println("已生成模拟数据，现在可以使用 'histogram' 命令查看。");
+                    break;
+
+                case "clear":
+                    heapAnalyzer.getObjectTracker().clear();
+                    System.out.println("已清除所有跟踪数据。");
+                    break;
+
+                case "stats":
+                    showInternalStats();
+                    break;
+
+                default:
+                    System.err.println("未知动作：" + action);
+                    System.err.println("用法：debug <add-data|clear|stats>");
+            }
+        }
+
+        private void addMockData() {
+            com.jvm.analyzer.heap.ObjectTracker tracker = heapAnalyzer.getObjectTracker();
+
+            // 模拟各种类的分配
+            addMockAllocations(tracker, "java.lang.String", 5000, 50);
+            addMockAllocations(tracker, "java.util.HashMap$Node", 3000, 32);
+            addMockAllocations(tracker, "java.util.ArrayList", 1000, 1024);
+            addMockAllocations(tracker, "com.example.User", 500, 256);
+            addMockAllocations(tracker, "com.example.Order", 300, 512);
+            addMockAllocations(tracker, "java.util.concurrent.ConcurrentHashMap$Node", 2000, 64);
+            addMockAllocations(tracker, "java.lang.StringBuilder", 800, 128);
+            addMockAllocations(tracker, "com.example.cache.CacheEntry", 1500, 200);
+        }
+
+        private void addMockAllocations(com.jvm.analyzer.heap.ObjectTracker tracker,
+                                       String className, int count, int size) {
+            for (int i = 0; i < count; i++) {
+                long objectId = System.nanoTime() + i;
+                com.jvm.analyzer.core.AllocationRecord record =
+                    new com.jvm.analyzer.core.AllocationRecord(
+                        objectId,
+                        className,
+                        size,
+                        System.currentTimeMillis() - (long)(Math.random() * 100000),
+                        Thread.currentThread().getId(),
+                        Thread.currentThread().getName(),
+                        new StackTraceElement[] {
+                            new StackTraceElement(className, "create", className.split("\\.")[2] + ".java", 42)
+                        }
+                    );
+                tracker.track(record);
+            }
+        }
+
+        private void showInternalStats() {
+            com.jvm.analyzer.heap.ObjectTracker tracker = heapAnalyzer.getObjectTracker();
+            Map<String, com.jvm.analyzer.heap.ObjectTracker.ClassInfo> stats = tracker.getClassStatistics();
+
+            System.out.println("=== 内部统计信息 ===");
+            System.out.println("跟踪中的对象数：" + tracker.getTrackedCount());
+            System.out.println("累计跟踪对象数：" + tracker.getTotalTracked());
+            System.out.println("已释放对象数：" + tracker.getTotalFreed());
+            System.out.println("不同类的数量：" + stats.size());
+            System.out.println();
+
+            if (!stats.isEmpty()) {
+                System.out.println("按总大小排序的前 10 个类:");
+                List<com.jvm.analyzer.heap.ObjectTracker.ClassInfo> sorted = new ArrayList<>(stats.values());
+                sorted.sort(java.util.Comparator.comparingLong(
+                    (com.jvm.analyzer.heap.ObjectTracker.ClassInfo c) -> c.totalSize).reversed());
+
+                for (int i = 0; i < Math.min(10, sorted.size()); i++) {
+                    com.jvm.analyzer.heap.ObjectTracker.ClassInfo info = sorted.get(i);
+                    System.out.printf("  %d. %s: %d 个实例，%d 字节%n",
+                        i + 1, info.className, info.instanceCount, info.totalSize);
+                }
+            }
         }
     }
 }

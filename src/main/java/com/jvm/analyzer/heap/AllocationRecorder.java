@@ -13,6 +13,8 @@ import java.util.concurrent.atomic.*;
  * the JVMTI agent. It provides allocation tracking when native
  * agent is not available.
  *
+ * 分配记录器
+ * 
  * @author Java Memory Analyzer Team
  * @version 1.0.0
  */
@@ -31,8 +33,7 @@ public class AllocationRecorder {
     private volatile Thread recorderThread;
 
     // Memory usage history
-    private final ConcurrentLinkedQueue<MemorySample> memoryHistory =
-        new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<MemorySample> memoryHistory = new ConcurrentLinkedQueue<>();
     private final int maxHistorySize = 1000;
 
     /**
@@ -85,6 +86,7 @@ public class AllocationRecorder {
 
     /**
      * Sampling loop - periodically samples memory usage
+     * 采样循环（Sampling Loop）
      */
     private void samplingLoop() {
         long lastSampleTime = System.currentTimeMillis();
@@ -114,11 +116,10 @@ public class AllocationRecorder {
         MemoryUsage heapUsage = memoryMXBean.getHeapMemoryUsage();
 
         MemorySample sample = new MemorySample(
-            System.currentTimeMillis(),
-            heapUsage.getUsed(),
-            heapUsage.getCommitted(),
-            heapUsage.getMax()
-        );
+                System.currentTimeMillis(),
+                heapUsage.getUsed(),
+                heapUsage.getCommitted(),
+                heapUsage.getMax());
 
         memoryHistory.offer(sample);
 
@@ -130,7 +131,8 @@ public class AllocationRecorder {
 
     /**
      * Record an allocation
-     *
+     * 采样策略
+     * 
      * @param record Allocation record
      */
     public void record(AllocationRecord record) {
@@ -138,13 +140,13 @@ public class AllocationRecorder {
             return;
         }
 
-        // Apply sampling
+        // Apply sampling 采样：每 100 次只记录 1 次
         long count = sampleCounter.incrementAndGet();
         if (count % sampleInterval != 0) {
             return;
         }
 
-        // Record allocation
+        // Record allocation 只有 1% 进入这里
         recordCount.incrementAndGet();
         recordBytes.addAndGet(record.getSize());
 
@@ -157,13 +159,13 @@ public class AllocationRecorder {
     /**
      * Record allocation with current stack trace
      *
-     * @param objectId Object ID
+     * @param objectId  Object ID
      * @param className Class name
-     * @param size Size in bytes
+     * @param size      Size in bytes
      */
     public void recordAllocation(long objectId, String className, long size) {
         AllocationRecord record = AllocationRecord.createFromCurrent(
-            objectId, className, size);
+                objectId, className, size);
         record(record);
     }
 
@@ -234,19 +236,21 @@ public class AllocationRecorder {
          * Get usage percentage
          */
         public double getUsagePercent() {
-            if (max <= 0) return 0;
+            if (max <= 0)
+                return 0;
             return (double) used / max * 100.0;
         }
 
         @Override
         public String toString() {
             return String.format("MemorySample{time=%d, used=%dMB, committed=%dMB, max=%dMB}",
-                timestamp, used / 1024 / 1024, committed / 1024 / 1024, max / 1024 / 1024);
+                    timestamp, used / 1024 / 1024, committed / 1024 / 1024, max / 1024 / 1024);
         }
     }
 
     /**
      * GC Monitor - monitors garbage collection events
+     * GC 监控原理
      */
     public static class GcMonitor {
 
@@ -264,10 +268,11 @@ public class AllocationRecorder {
         }
 
         public void start() {
-            if (running) return;
+            if (running)
+                return;
 
             running = true;
-            // Initialize counters
+            // Initialize counters  从 JVM 获取 GC 统计
             for (GarbageCollectorMXBean bean : gcBeans) {
                 lastCollectionCount.addAndGet(bean.getCollectionCount());
                 lastCollectionTime.addAndGet(bean.getCollectionTime());
@@ -328,10 +333,9 @@ public class AllocationRecorder {
             }
 
             return new GcStatistics(
-                totalCollections.get(),
-                totalPauseTime.get(),
-                lastCollectionTime.get()
-            );
+                    totalCollections.get(),
+                    totalPauseTime.get(),
+                    lastCollectionTime.get());
         }
     }
 

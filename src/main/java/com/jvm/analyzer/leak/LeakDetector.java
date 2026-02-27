@@ -18,6 +18,7 @@ import java.util.concurrent.locks.*;
  *
  * Thread-safe implementation.
  *
+ * 内存泄漏检测器
  * @author Java Memory Analyzer Team
  * @version 1.0.0
  */

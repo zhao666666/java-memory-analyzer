@@ -1,5 +1,7 @@
 package com.jvm.analyzer.attach;
 
+import com.jvm.analyzer.heap.AllocationClassTransformer;
+
 import java.lang.instrument.*;
 import java.security.ProtectionDomain;
 import java.util.*;
@@ -50,25 +52,54 @@ public class AgentLoader {
             parseOptions(agentArgs);
         }
 
-        // Set up native library path
+        // Set up native library path - try multiple locations
+        String[] possibleLibPaths = {
+            System.getProperty("user.dir") + "/lib",
+            new java.io.File(AgentLoader.class.getProtectionDomain()
+                .getCodeSource().getLocation().getPath()).getParent() + "/lib",
+            System.getProperty("java.io.tmpdir"),
+        };
+
         String nativePath = System.getProperty("java.library.path");
-        String agentLibPath = System.getProperty("user.dir") + "/lib";
-        if (!nativePath.contains(agentLibPath)) {
-            System.setProperty("java.library.path",
-                nativePath + ":" + agentLibPath);
+        boolean loaded = false;
+
+        // Try to load from known locations first
+        for (String libPath : possibleLibPaths) {
+            if (libPath == null) continue;
+            String fullPath = libPath + java.io.File.separator + "libjvmti_agent.dylib";
+            java.io.File libFile = new java.io.File(fullPath);
+            if (libFile.exists()) {
+                try {
+                    System.load(libFile.getAbsolutePath());
+                    System.err.println("[AgentLoader] Native library loaded from: " + fullPath);
+                    loaded = true;
+                    break;
+                } catch (UnsatisfiedLinkError e) {
+                    System.err.println("[AgentLoader] Failed to load from " + fullPath + ": " + e.getMessage());
+                }
+            }
         }
 
-        // Try to load native library
-        try {
-            System.loadLibrary("jvmti_agent");
-            System.err.println("[AgentLoader] Native library loaded successfully");
-        } catch (UnsatisfiedLinkError e) {
-            System.err.println("[AgentLoader] Warning: Could not load native library: " + e.getMessage());
-            System.err.println("[AgentLoader] Running in Java-only mode");
+        // Fallback to library path
+        if (!loaded) {
+            try {
+                System.loadLibrary("jvmti_agent");
+                System.err.println("[AgentLoader] Native library loaded successfully");
+            } catch (UnsatisfiedLinkError e) {
+                System.err.println("[AgentLoader] Warning: Could not load native library: " + e.getMessage());
+                System.err.println("[AgentLoader] Running in Java-only mode (bytecode instrumentation)");
+            }
         }
 
-        // Register transformer for class instrumentation (if needed)
-        inst.addTransformer(new MemoryAnalysisTransformer(), true);
+        // Register transformer for class instrumentation using ASM bytecode weaving
+        // This enables object allocation tracking without relying on JVMTI events
+        // The transformer will lazily initialize HeapAnalyzer on first allocation
+        inst.addTransformer(new AllocationClassTransformer(), true);
+
+        // Also support retransformation for already loaded classes (optional)
+        if (inst.isRetransformClassesSupported()) {
+            System.err.println("[AgentLoader] Retransformation supported");
+        }
 
         agentInitialized = true;
         System.err.println("[AgentLoader] Agent initialized with options: " + options);
@@ -115,32 +146,5 @@ public class AgentLoader {
      */
     public static Map<String, String> getOptions() {
         return Collections.unmodifiableMap(options);
-    }
-
-    /**
-     * Memory Analysis Transformer - instruments classes for memory tracking
-     */
-    static class MemoryAnalysisTransformer implements ClassFileTransformer {
-
-        @Override
-        public byte[] transform(ClassLoader loader, String className,
-                               Class<?> classBeingRedefined,
-                               ProtectionDomain protectionDomain,
-                               byte[] classfileBuffer) throws IllegalClassFormatException {
-            // Skip internal classes and analyzer classes
-            if (className == null ||
-                className.startsWith("java/") ||
-                className.startsWith("javax/") ||
-                className.startsWith("sun/") ||
-                className.startsWith("com/jvm/analyzer/")) {
-                return null;
-            }
-
-            // For now, we don't transform classes
-            // The JVMTI agent handles allocation tracking at the VM level
-            // This transformer is here for future bytecode instrumentation needs
-
-            return null; // No transformation
-        }
     }
 }

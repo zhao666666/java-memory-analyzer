@@ -14,22 +14,20 @@ import java.util.concurrent.locks.*;
  *
  * Thread-safe implementation using concurrent data structures.
  *
+ * 对象跟踪器
  * @author Java Memory Analyzer Team
  * @version 1.0.0
  */
 public class ObjectTracker {
 
     // Object registry: objectId -> AllocationRecord
-    private final ConcurrentHashMap<Long, AllocationRecord> objectRegistry =
-        new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, AllocationRecord> objectRegistry =new ConcurrentHashMap<>();
 
     // Class statistics: className -> ClassInfo
-    private final ConcurrentHashMap<String, ClassInfo> classStats =
-        new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ClassInfo> classStats =new ConcurrentHashMap<>();
 
     // Allocation site statistics: site -> SiteInfo
-    private final ConcurrentHashMap<String, SiteInfo> siteStats =
-        new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, SiteInfo> siteStats = new ConcurrentHashMap<>();
 
     // Reference queue for detecting GC'd objects
     private final AtomicLong trackedCount = new AtomicLong(0);

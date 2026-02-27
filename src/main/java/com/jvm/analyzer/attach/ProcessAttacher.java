@@ -15,6 +15,7 @@ import java.nio.file.*;
  *
  * @author Java Memory Analyzer Team
  * @version 1.0.0
+ *  附着到目标 JVM 进程
  */
 public class ProcessAttacher {
 
@@ -76,7 +77,8 @@ public class ProcessAttacher {
      *
      * @return List of process information
      */
-    public static List<ProcessInfo> listJavaProcesses() {
+    public static List<ProcessInfo> 
+    listJavaProcesses() {
         List<ProcessInfo> processes = new ArrayList<>();
 
         try {

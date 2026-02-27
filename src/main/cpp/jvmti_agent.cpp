@@ -93,6 +93,7 @@ struct AllocationEvent {
 
 /**
  * Lock-free ring buffer for event queue
+ * 无锁环形缓冲区（Ring Buffer）
  */
 class EventQueue {
 private:
@@ -266,8 +267,14 @@ public:
 // ============================================================================
 
 static jvmtiEnv* g_jvmti = nullptr;
+static JNIEnv* g_jni_env = nullptr;
+static JavaVM* g_java_vm = nullptr;
 static AllocationTracker g_tracker;
 static EventQueue g_event_queue;
+
+// Java class and method references for JNI callback
+static jclass g_heap_analyzer_class = nullptr;
+static jmethodID g_on_object_alloc_method = nullptr;
 
 static std::atomic<bool> g_agent_active{true};
 static std::atomic<bool> g_sampling_enabled{true};
@@ -292,12 +299,24 @@ static inline jlong get_current_timestamp() {
 }
 
 static inline uint64_t get_current_thread_id() {
-    return static_cast<uint64_t>(pthread_self());
+    uint64_t thread_id = 0;
+    pthread_mutex_lock(&g_print_mutex);
+    thread_id = (uint64_t)(uintptr_t)pthread_self();
+    pthread_mutex_unlock(&g_print_mutex);
+    return thread_id;
 }
 
 static void safe_print(const char* msg) {
     pthread_mutex_lock(&g_print_mutex);
     fprintf(stderr, "[JVM TI] %s\n", msg);
+    pthread_mutex_unlock(&g_print_mutex);
+}
+
+static void safe_print(const char* format, int value) {
+    pthread_mutex_lock(&g_print_mutex);
+    fprintf(stderr, "[JVM TI] ");
+    fprintf(stderr, format, value);
+    fprintf(stderr, "\n");
     pthread_mutex_unlock(&g_print_mutex);
 }
 
@@ -307,15 +326,19 @@ static void safe_print(const char* msg) {
 
 static jvmtiFrameInfo* capture_stack_trace(jvmtiEnv* jvmti, jint* frame_count,
                                            jint max_depth = MAX_STACK_DEPTH) {
-    jvmtiFrameInfo* frames = nullptr;
+    jvmtiFrameInfo* frames = (jvmtiFrameInfo*)malloc(sizeof(jvmtiFrameInfo) * max_depth);
+    if (!frames) return nullptr;
 
-    if (JVMTI_ERROR_NONE != jvmti->GetStackTrace(NULL, 2, max_depth,
-                                                  frame_count, &frames)) {
+    // GetStackTrace signature: GetStackTrace(jthread, jint startDepth, jint maxCount, jvmtiFrameInfo*, jint*)
+    jvmtiError err = jvmti->GetStackTrace(NULL, 0, max_depth, frames, frame_count);
+
+    if (JVMTI_ERROR_NONE != err) {
+        free(frames);
         return nullptr;
     }
 
     if (*frame_count <= 0) {
-        jvmti->Deallocate((unsigned char*)frames);
+        free(frames);
         return nullptr;
     }
 
@@ -324,8 +347,103 @@ static jvmtiFrameInfo* capture_stack_trace(jvmtiEnv* jvmti, jint* frame_count,
 
 static void free_stack_trace(jvmtiFrameInfo* frames) {
     if (frames) {
-        g_jvmti->Deallocate((unsigned char*)frames);
+        free(frames);
     }
+}
+
+/**
+ * Build stack trace string from jvmtiFrameInfo
+ * Format: "class.method(file:line);class.method(file:line);..."
+ */
+static char* build_stack_trace_string(jvmtiEnv* jvmti, JNIEnv* jni,
+                                       jvmtiFrameInfo* frames, jint frame_count) {
+    if (!frames || frame_count <= 0) {
+        return nullptr;
+    }
+
+    std::string result;
+    for (int i = 0; i < frame_count && i < 20; i++) {  // Limit to 20 frames
+        jvmtiFrameInfo* frame = &frames[i];
+
+        // Get method name
+        char* method_name = nullptr;
+        char* method_sig = nullptr;
+        char* method_generic = nullptr;
+        if (jvmti->GetMethodName(frame->method, &method_name, &method_sig, &method_generic) != JVMTI_ERROR_NONE || !method_name) {
+            method_name = (char*)"unknown";
+        }
+
+        // Get class name
+        char* class_name = nullptr;
+        jclass klass = nullptr;
+        if (jvmti->GetMethodDeclaringClass(frame->method, &klass) == JVMTI_ERROR_NONE && klass) {
+            jvmti->GetClassSignature(klass, &class_name, nullptr);
+        }
+        if (!class_name) {
+            class_name = (char*)"unknown";
+        }
+
+        // Get line number - use GetLineNumberTable
+        jint line_number = 0;
+        jint table_count = 0;
+        jvmtiLineNumberEntry* table = nullptr;
+        if (jvmti->GetLineNumberTable(frame->method, &table_count, &table) == JVMTI_ERROR_NONE && table) {
+            // Find the line number for the current location
+            for (int j = 0; j < table_count; j++) {
+                if (table[j].start_location <= frame->location) {
+                    line_number = table[j].line_number;
+                } else {
+                    break;
+                }
+            }
+            jvmti->Deallocate((unsigned char*)table);
+        }
+
+        // Get source file name
+        char* source_file = nullptr;
+        if (klass) {
+            jvmti->GetSourceFileName(klass, &source_file);
+        }
+        if (!source_file) {
+            source_file = (char*)"unknown";
+        }
+
+        // Build string: "class.method(file:line);"
+        if (i > 0) result += ";";
+        result += class_name;
+        result += ".";
+        result += method_name;
+        result += "(";
+        result += source_file;
+        result += ":";
+        result += std::to_string(line_number);
+        result += ")";
+
+        // Free JVMTI allocated memory
+        if (method_name && strcmp(method_name, "unknown") != 0) {
+            jvmti->Deallocate((unsigned char*)method_name);
+        }
+        if (method_sig) {
+            jvmti->Deallocate((unsigned char*)method_sig);
+        }
+        if (method_generic) {
+            jvmti->Deallocate((unsigned char*)method_generic);
+        }
+        if (class_name && strcmp(class_name, "unknown") != 0) {
+            jvmti->Deallocate((unsigned char*)class_name);
+        }
+        if (source_file && strcmp(source_file, "unknown") != 0) {
+            jvmti->Deallocate((unsigned char*)source_file);
+        }
+        if (klass) {
+            jni->DeleteLocalRef(klass);
+        }
+    }
+
+    // Copy to C string
+    char* result_str = (char*)malloc(result.length() + 1);
+    strcpy(result_str, result.c_str());
+    return result_str;
 }
 
 // ============================================================================
@@ -335,6 +453,8 @@ static void free_stack_trace(jvmtiFrameInfo* frames) {
 /**
  * Object Allocation Event Handler
  */
+// 这是 C++ 代码，运行在 JVM 内部
+// 每当有对象分配，JVM 会自动调用这个回调函数
 void JNICALL CallbackObjectAlloc(jvmtiEnv* jvmti_env, JNIEnv* jni_env,
                                   jthread thread, jobject object,
                                   jclass object_klass, jlong size) {
@@ -351,12 +471,8 @@ void JNICALL CallbackObjectAlloc(jvmtiEnv* jvmti_env, JNIEnv* jni_env,
     }
 
     // Get object tag
-    jlong tag = 0;
-    if (JVMTI_ERROR_NONE != jvmti_env->GetObjectTag(object, &tag)) {
-        // Generate a new tag
-        tag = (jlong)(uintptr_t)object;
-        jvmti_env->SetObjectTag(object, tag);
-    }
+    // Note: GetObjectTag/SetObjectTag removed in newer JDK, use object address as tag
+    jlong tag = (jlong)(uintptr_t)object;
 
     // Capture stack trace
     jint frame_count = 0;
@@ -399,6 +515,67 @@ void JNICALL CallbackObjectAlloc(jvmtiEnv* jvmti_env, JNIEnv* jni_env,
     // Call callback if registered
     if (g_event_callback) {
         g_event_callback(event);
+    }
+
+    // ===== Call Java layer via JNI =====
+    // Notify Java layer about this allocation
+    if (g_java_vm && g_heap_analyzer_class && g_on_object_alloc_method) {
+        JNIEnv* env = nullptr;
+        bool attached = false;
+
+        // Get JNIEnv for current thread
+        if (g_java_vm->GetEnv((void**)&env, JNI_VERSION_1_8) != JNI_OK) {
+            // Not attached, attach current thread
+            if (g_java_vm->AttachCurrentThread((void**)&env, nullptr) == JNI_OK) {
+                attached = true;
+            }
+        }
+
+        if (env) {
+            // Get class name
+            char* class_sig = nullptr;
+            jvmti_env->GetClassSignature(object_klass, &class_sig, nullptr);
+            std::string class_name = class_sig ? class_sig : "unknown";
+            // Remove L and ; from signature (e.g., "Ljava/lang/String;" -> "java/lang/String")
+            if (class_name[0] == 'L') {
+                class_name = class_name.substr(1, class_name.length() - 2);
+            }
+
+            // Build stack trace string
+            char* stack_trace = build_stack_trace_string(jvmti_env, env, frames, frame_count);
+
+            // Get thread info
+            std::string thread_name = "unknown";
+            jlong thread_id = get_current_thread_id();
+
+            // Call Java method
+            jstring classNameStr = env->NewStringUTF(class_name.c_str());
+            jstring threadNameStr = env->NewStringUTF(thread_name.c_str());
+            jstring stackTraceStr = stack_trace ? env->NewStringUTF(stack_trace) : nullptr;
+
+            env->CallStaticVoidMethod(
+                g_heap_analyzer_class,
+                g_on_object_alloc_method,
+                tag,
+                classNameStr,
+                size,
+                thread_id,
+                threadNameStr,
+                stackTraceStr
+            );
+
+            // Clean up local refs
+            env->DeleteLocalRef(classNameStr);
+            env->DeleteLocalRef(threadNameStr);
+            if (stackTraceStr) env->DeleteLocalRef(stackTraceStr);
+            if (class_sig) jvmti_env->Deallocate((unsigned char*)class_sig);
+            if (stack_trace) free(stack_trace);
+
+            // Detach if we attached
+            if (attached) {
+                g_java_vm->DetachCurrentThread();
+            }
+        }
     }
 }
 
@@ -487,17 +664,11 @@ static void event_processor_loop() {
             }
 
             // Cleanup global refs
-            if (event.klass && g_jvmti) {
-                JNIEnv* env = nullptr;
-                if (JVMTI_ERROR_NONE == g_jvmti->GetEnv((void**)&env, JVMTI_VERSION_1_8)) {
-                    env->DeleteGlobalRef(event.klass);
-                }
+            if (event.klass && g_jni_env) {
+                g_jni_env->DeleteGlobalRef(event.klass);
             }
-            if (event.thread && g_jvmti) {
-                JNIEnv* env = nullptr;
-                if (JVMTI_ERROR_NONE == g_jvmti->GetEnv((void**)&env, JVMTI_VERSION_1_8)) {
-                    env->DeleteGlobalRef(event.thread);
-                }
+            if (event.thread && g_jni_env) {
+                g_jni_env->DeleteGlobalRef(event.thread);
             }
 
             // Free frames
@@ -550,11 +721,12 @@ static jvmtiError enable_capabilities(jvmtiEnv* jvmti) {
     memset(&caps, 0, sizeof(caps));
 
     // Core capabilities for memory analysis
-    caps.can_generate_allocation_samples = 1;
+    // Note: can_generate_allocation_samples and can_generate_vm_object_alloc_events
+    // are not available in all JDK versions. We use the generic events capability.
+    caps.can_generate_all_class_hook_events = 1;
     caps.can_generate_object_free_events = 1;
     caps.can_generate_garbage_collection_events = 1;
     caps.can_tag_objects = 1;
-    caps.can_generate_vm_object_alloc_events = 1;
     caps.can_get_owned_monitor_info = 1;
     caps.can_get_current_contended_monitor = 1;
     caps.can_get_source_file_name = 1;
@@ -613,10 +785,31 @@ JNIEXPORT jint JNICALL Agent_OnAttach(JavaVM* vm, char* options, void* reserved)
         fprintf(stderr, "[JVM TI] Failed to get JNIEnv\n");
         return JNI_ERR;
     }
+    g_jni_env = env;  // Save global JNI env
+    g_java_vm = vm;   // Save Java VM pointer
 
-    if (vm->GetEnv((void**)&g_jvmti, JVMTI_VERSION_1_8) != JNI_OK) {
+    if (vm->GetEnv((void**)&g_jvmti, JNI_VERSION_1_8) != JNI_OK) {
         fprintf(stderr, "[JVM TI] Failed to get JVMTI env\n");
         return JNI_ERR;
+    }
+
+    // Find HeapAnalyzer class and onObjectAlloc method for JNI callback
+    jclass ha_class = env->FindClass("com/jvm/analyzer/heap/HeapAnalyzer");
+    if (ha_class) {
+        g_heap_analyzer_class = (jclass)env->NewGlobalRef(ha_class);
+        g_on_object_alloc_method = env->GetStaticMethodID(
+            g_heap_analyzer_class,
+            "onObjectAlloc",
+            "(JLjava/lang/String;JJLjava/lang/String;Ljava/lang/String;)V"
+        );
+        if (g_on_object_alloc_method) {
+            fprintf(stderr, "[JVM TI] Found onObjectAlloc method for callback\n");
+        } else {
+            fprintf(stderr, "[JVM TI] Warning: onObjectAlloc method not found\n");
+        }
+        env->DeleteLocalRef(ha_class);
+    } else {
+        fprintf(stderr, "[JVM TI] Warning: HeapAnalyzer class not found\n");
     }
 
     // Parse options
@@ -661,8 +854,84 @@ JNIEXPORT jint JNICALL Agent_OnAttach(JavaVM* vm, char* options, void* reserved)
 JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char* options, void* reserved) {
     fprintf(stderr, "[JVM TI] Agent_OnLoad called, options: %s\n", options ? options : "none");
 
-    // Same initialization as Agent_OnAttach
-    return Agent_OnAttach(vm, options, reserved);
+    // Get JNIEnv - in some VMs this might fail at very early stage
+    // We need to handle this gracefully
+    g_java_vm = vm;
+
+    // Try to get JVMTI interface directly from JavaVM
+    // This is the recommended way for JVMTI agents
+    jint jvmtiResult = vm->GetEnv((void**)&g_jvmti, JVMTI_VERSION_1_0);
+    if (jvmtiResult != JNI_OK) {
+        fprintf(stderr, "[JVM TI] GetEnv for JVMTI returned %d, trying JNI_VERSION_1_8...\n", jvmtiResult);
+        // Try with JNI_VERSION_1_8 as fallback
+        if (vm->GetEnv((void**)&g_jvmti, JNI_VERSION_1_8) != JNI_OK) {
+            fprintf(stderr, "[JVM TI] Failed to get JVMTI env\n");
+            return JNI_ERR;
+        }
+    }
+
+    fprintf(stderr, "[JVM TI] JVMTI interface obtained\n");
+
+    // Try to get JNIEnv (might not be available in all VMs at this stage)
+    if (vm->GetEnv((void**)&g_jni_env, JNI_VERSION_1_8) == JNI_OK) {
+        fprintf(stderr, "[JVM TI] JNIEnv available\n");
+
+        // Try to find HeapAnalyzer class (may not be available at this early stage)
+        jclass ha_class = g_jni_env->FindClass("com/jvm/analyzer/heap/HeapAnalyzer");
+        if (ha_class) {
+            g_heap_analyzer_class = (jclass)g_jni_env->NewGlobalRef(ha_class);
+            g_on_object_alloc_method = g_jni_env->GetStaticMethodID(
+                g_heap_analyzer_class,
+                "onObjectAlloc",
+                "(JLjava/lang/String;JJLjava/lang/String;Ljava/lang/String;)V"
+            );
+            if (g_on_object_alloc_method) {
+                fprintf(stderr, "[JVM TI] Found onObjectAlloc method for callback\n");
+            }
+            g_jni_env->DeleteLocalRef(ha_class);
+        } else {
+            fprintf(stderr, "[JVM TI] HeapAnalyzer class not found (will try later)\n");
+        }
+    } else {
+        fprintf(stderr, "[JVM TI] JNIEnv not available at load time, will use JNI callbacks\n");
+    }
+
+    // Parse options
+    if (options) {
+        char* opt = strtok(options, ",");
+        while (opt) {
+            if (strncmp(opt, "sampling=", 9) == 0) {
+                int interval = atoi(opt + 9);
+                if (interval > 0) {
+                    g_sampling_interval.store(interval, std::memory_order_release);
+                }
+            } else if (strcmp(opt, "nosampling") == 0) {
+                g_sampling_enabled.store(false, std::memory_order_release);
+            }
+            opt = strtok(nullptr, ",");
+        }
+    }
+
+    // Enable capabilities
+    jvmtiError err = enable_capabilities(g_jvmti);
+    if (err != JVMTI_ERROR_NONE) {
+        fprintf(stderr, "[JVM TI] Failed to enable capabilities: %d\n", err);
+        return JNI_ERR;
+    }
+    fprintf(stderr, "[JVM TI] Capabilities enabled\n");
+
+    // Setup callbacks
+    setup_callbacks(g_jvmti);
+
+    // Enable events
+    enable_events(g_jvmti);
+    fprintf(stderr, "[JVM TI] Events enabled\n");
+
+    // Start event processor thread
+    g_event_processor_thread = std::thread(event_processor_loop);
+
+    fprintf(stderr, "[JVM TI] Agent successfully loaded\n");
+    return JNI_OK;
 }
 
 /**
@@ -686,6 +955,20 @@ JNIEXPORT void JNICALL Agent_OnUnload(JavaVM* vm) {
         g_jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_GARBAGE_COLLECTION_START, nullptr);
         g_jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_GARBAGE_COLLECTION_FINISH, nullptr);
     }
+
+    // Clean up global refs
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_8) == JNI_OK && env) {
+        if (g_heap_analyzer_class) {
+            env->DeleteGlobalRef(g_heap_analyzer_class);
+            g_heap_analyzer_class = nullptr;
+        }
+    }
+
+    g_jvmti = nullptr;
+    g_jni_env = nullptr;
+    g_java_vm = nullptr;
+    g_on_object_alloc_method = nullptr;
 
     fprintf(stderr, "[JVM TI] Agent unloaded\n");
 }

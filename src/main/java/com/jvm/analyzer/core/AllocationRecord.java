@@ -14,14 +14,18 @@ import java.util.concurrent.*;
  */
 public class AllocationRecord {
 
-    private final long objectId;
-    private final String className;
-    private final long size;
-    private final long timestamp;
-    private final long threadId;
-    private final String threadName;
-    private final StackTraceElement[] stackTrace;
-    private final String allocationSite;
+    // 核心信息
+    private final long objectId; // 对象唯一标识
+    private final String className; // 类名（比如 java.lang.String）
+    private final long size; // 占用字节数
+    private final long timestamp; // 分配时间
+
+    // 上下文信息
+    private final long threadId; // 哪个线程分配的
+    private final String threadName; // 线程名
+    private final StackTraceElement[] stackTrace; // 调用栈！最关键！
+    private final String allocationSite; // 分配位置（简化版）
+
     private final int hashCode;
 
     private static final ConcurrentHashMap<String, Integer> siteCounter = new ConcurrentHashMap<>();
@@ -29,17 +33,16 @@ public class AllocationRecord {
     /**
      * Create allocation record
      *
-     * @param objectId    Unique object identifier/tag
-     * @param className   Class name of allocated object
-     * @param size        Size in bytes
-     * @param timestamp   Allocation timestamp
-     * @param threadId    Allocating thread ID
-     * @param threadName  Allocating thread name
-     * @param stackTrace  Stack trace at allocation point
+     * @param objectId   Unique object identifier/tag
+     * @param className  Class name of allocated object
+     * @param size       Size in bytes
+     * @param timestamp  Allocation timestamp
+     * @param threadId   Allocating thread ID
+     * @param threadName Allocating thread name
+     * @param stackTrace Stack trace at allocation point
      */
-    public AllocationRecord(long objectId, String className, long size,
-                           long timestamp, long threadId, String threadName,
-                           StackTraceElement[] stackTrace) {
+    public AllocationRecord(long objectId, String className, long size, long timestamp, long threadId,
+            String threadName, StackTraceElement[] stackTrace) {
         this.objectId = objectId;
         this.className = className;
         this.size = size;
@@ -62,10 +65,10 @@ public class AllocationRecord {
         // Find first non-framework frame
         for (StackTraceElement element : trace) {
             String className = element.getClassName();
-            // Skip internal JVM and analyzer frames
+            // Skip internal JVM and analyzer frames 跳过 JVM 内部框架和我们自己的分析器代码
             if (!className.startsWith("sun.") &&
-                !className.startsWith("java.lang.") &&
-                !className.startsWith("com.jvm.analyzer.")) {
+                    !className.startsWith("java.lang.") &&
+                    !className.startsWith("com.jvm.analyzer.")) {
                 return element.toString();
             }
         }
@@ -179,8 +182,10 @@ public class AllocationRecord {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
+        if (this == o)
+            return true;
+        if (o == null || getClass() != o.getClass())
+            return false;
         AllocationRecord that = (AllocationRecord) o;
         return objectId == that.objectId;
     }
@@ -193,7 +198,7 @@ public class AllocationRecord {
     @Override
     public String toString() {
         return String.format("AllocationRecord{obj=%d, class=%s, size=%d, site=%s, age=%s}",
-            objectId, className, size, allocationSite, getAgeString());
+                objectId, className, size, allocationSite, getAgeString());
     }
 
     /**
@@ -226,14 +231,13 @@ public class AllocationRecord {
         }
 
         return new AllocationRecord(
-            objectId,
-            className,
-            size,
-            System.currentTimeMillis(),
-            Thread.currentThread().getId(),
-            Thread.currentThread().getName(),
-            trace
-        );
+                objectId,
+                className,
+                size,
+                System.currentTimeMillis(),
+                Thread.currentThread().getId(),
+                Thread.currentThread().getName(),
+                trace);
     }
 
     /**
@@ -299,7 +303,7 @@ public class AllocationRecord {
 
         public AllocationRecord build() {
             return new AllocationRecord(objectId, className, size, timestamp,
-                                       threadId, threadName, stackTrace);
+                    threadId, threadName, stackTrace);
         }
     }
 }

@@ -19,12 +19,15 @@ import java.util.function.*;
  *
  * All operations are thread-safe.
  *
+ * 堆分析协调器
  * @author Java Memory Analyzer Team
  * @version 1.0.0
  */
 public class HeapAnalyzer {
 
+    //线程：监控对象分配
     private final ObjectTracker objectTracker;
+    //线程：记录调用栈
     private final AllocationRecorder allocationRecorder;
     private final AllocationRecorder.GcMonitor gcMonitor;
     private final MemoryMXBean memoryMXBean;
@@ -35,15 +38,18 @@ public class HeapAnalyzer {
 
     private final ReadWriteLock snapshotLock = new ReentrantReadWriteLock();
     private final List<MemorySnapshot> snapshots = new CopyOnWriteArrayList<>();
-    private final ConcurrentLinkedQueue<AllocationRecord> recentAllocations =
-        new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<AllocationRecord> recentAllocations = new ConcurrentLinkedQueue<>();
 
-    // Statistics
+    // Statistics 统计
     private final ThreadSafeCounter allocCounter = new ThreadSafeCounter();
-    private final ThreadSafeCounter.CounterMap<String> classAllocCounter =
-        new ThreadSafeCounter.CounterMap<>();
-    private final ThreadSafeCounter.CounterMap<String> threadAllocCounter =
-        new ThreadSafeCounter.CounterMap<>();
+    private final ThreadSafeCounter.CounterMap<String> classAllocCounter = new ThreadSafeCounter.CounterMap<>();
+    private final ThreadSafeCounter.CounterMap<String> threadAllocCounter =new ThreadSafeCounter.CounterMap<>();
+
+    // JNI callback reference
+    private static volatile HeapAnalyzer instance = null;
+
+    // Object ID generator for instrumentation mode
+    private static final AtomicLong objectIdGenerator = new AtomicLong(System.currentTimeMillis());
 
     /**
      * Create heap analyzer
@@ -64,6 +70,9 @@ public class HeapAnalyzer {
             }
         }
         this.heapMemoryPools = heapPools.toArray(new MemoryPoolMXBean[0]);
+
+        // Set instance for JNI callback
+        instance = this;
     }
 
     /**
@@ -321,5 +330,195 @@ public class HeapAnalyzer {
             this.topClasses = topClasses;
             this.topThreads = topThreads;
         }
+    }
+
+    // ========================================================================
+    // JNI Callback Methods (called from JVMTI Agent)
+    // ========================================================================
+
+    /**
+     * Callback from JVMTI Agent for object allocation events
+     * Called by native code via JNI
+     *
+     * @param tag       Object tag (unique ID)
+     * @param className Class name of allocated object
+     * @param size      Size in bytes
+     * @param threadId  Thread ID that allocated the object
+     * @param threadName Thread name
+     * @param stackTrace Stack trace elements (format: "class.method(file:line)")
+     */
+    public static void onObjectAlloc(long tag, String className, long size,
+                                      long threadId, String threadName, String stackTrace) {
+        if (instance != null) {
+            // Always record allocation, regardless of analyzing state
+            // This allows capturing allocations even before startAnalysis() is called
+            AllocationRecord record = new AllocationRecord(
+                tag,
+                className,
+                size,
+                System.currentTimeMillis(),
+                threadId,
+                threadName,
+                parseStackTrace(stackTrace)
+            );
+            instance.recordAllocation(record);
+        }
+    }
+
+    /**
+     * Parse stack trace string to array
+     */
+    private static StackTraceElement[] parseStackTrace(String trace) {
+        if (trace == null || trace.isEmpty()) {
+            return new StackTraceElement[0];
+        }
+        // Format: "class.method(file:line);class.method(file:line);..."
+        String[] parts = trace.split(";");
+        StackTraceElement[] elements = new StackTraceElement[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            // Parse "class.method(file:line)"
+            String part = parts[i].trim();
+            int methodStart = part.lastIndexOf('.');
+            int fileStart = part.lastIndexOf('(');
+            int lineStart = part.lastIndexOf(':');
+            int lineEnd = part.lastIndexOf(')');
+
+            if (methodStart > 0 && fileStart > 0 && lineStart > 0 && lineEnd > lineStart) {
+                String declaringClass = part.substring(0, methodStart);
+                String methodName = part.substring(methodStart + 1, fileStart);
+                String fileName = part.substring(fileStart + 1, lineStart);
+                int lineNumber = Integer.parseInt(part.substring(lineStart + 1, lineEnd));
+                elements[i] = new StackTraceElement(declaringClass, methodName, fileName, lineNumber);
+            }
+        }
+        return elements;
+    }
+
+    // ========================================================================
+    // Instrumentation Callback Methods (called from AllocationClassTransformer)
+    // ========================================================================
+
+    /**
+     * Callback from bytecode instrumentation for object allocation events
+     * Called by instrumented constructors via ASM
+     *
+     * This method is invoked at the end of object constructor execution,
+     * allowing us to track object allocations without relying on JVMTI events.
+     *
+     * @param obj  The newly allocated object
+     */
+    public static void onInstrumentedAllocation(Object obj) {
+        if (instance != null) {
+            // Generate unique object ID
+            long tag = objectIdGenerator.incrementAndGet();
+
+            // Get object class info
+            Class<?> clazz = obj.getClass();
+            String className = clazz.getName();
+
+            // Estimate object size (simplified estimation)
+            long estimatedSize = estimateObjectSize(obj);
+
+            // Get thread info
+            Thread currentThread = Thread.currentThread();
+            long threadId = currentThread.getId();
+            String threadName = currentThread.getName();
+
+            // Capture stack trace
+            StackTraceElement[] stackTrace = captureInstrumentationStackTrace();
+
+            // Create allocation record
+            AllocationRecord record = new AllocationRecord(
+                tag,
+                className,
+                estimatedSize,
+                System.currentTimeMillis(),
+                threadId,
+                threadName,
+                stackTrace
+            );
+
+            // Record the allocation
+            instance.recordAllocation(record);
+        }
+    }
+
+    /**
+     * Capture stack trace for instrumentation callback
+     * Skip the first few frames that are internal to the instrumentation
+     */
+    private static StackTraceElement[] captureInstrumentationStackTrace() {
+        // Get current stack trace
+        StackTraceElement[] fullTrace = Thread.currentThread().getStackTrace();
+
+        // Skip internal frames:
+        // [0] getStackTrace (native)
+        // [1] Thread.getStackTrace
+        // [2] HeapAnalyzer.captureInstrumentationStackTrace
+        // [3] HeapAnalyzer.onInstrumentedAllocation
+        // [4] <target class>.<init> (this is what we want to keep)
+
+        int skipFrames = 4;
+        if (fullTrace.length <= skipFrames) {
+            return new StackTraceElement[0];
+        }
+
+        // Keep remaining frames (the actual application call stack)
+        StackTraceElement[] result = new StackTraceElement[fullTrace.length - skipFrames];
+        System.arraycopy(fullTrace, skipFrames, result, 0, result.length);
+
+        // Limit to 20 frames for performance
+        if (result.length > 20) {
+            StackTraceElement[] limited = new StackTraceElement[20];
+            System.arraycopy(result, 0, limited, 0, 20);
+            return limited;
+        }
+
+        return result;
+    }
+
+    /**
+     * Estimate object size using simple heuristics
+     * This is a simplified estimation - for accurate sizing, use JVMTI
+     */
+    private static long estimateObjectSize(Object obj) {
+        if (obj == null) {
+            return 0;
+        }
+
+        Class<?> clazz = obj.getClass();
+
+        // Base object header (12-16 bytes depending on JVM)
+        long size = 16;
+
+        // Add size for primitive fields
+        try {
+            // Count declared fields (simplified estimation)
+            java.lang.reflect.Field[] fields = clazz.getDeclaredFields();
+            for (java.lang.reflect.Field field : fields) {
+                Class<?> fieldType = field.getType();
+                if (fieldType.isPrimitive()) {
+                    if (fieldType == long.class || fieldType == double.class) {
+                        size += 8;
+                    } else if (fieldType == int.class || fieldType == float.class) {
+                        size += 4;
+                    } else if (fieldType == short.class || fieldType == char.class) {
+                        size += 2;
+                    } else if (fieldType == boolean.class || fieldType == byte.class) {
+                        size += 1;
+                    }
+                } else {
+                    // Reference field (4-8 bytes)
+                    size += 8;
+                }
+            }
+        } catch (SecurityException e) {
+            // Cannot access fields, use default estimation
+        }
+
+        // Add padding for alignment (8-byte alignment)
+        size = ((size + 7) / 8) * 8;
+
+        return size;
     }
 }

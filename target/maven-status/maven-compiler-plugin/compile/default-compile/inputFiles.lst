@@ -1,5 +1,6 @@
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/leak/LeakDetector.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/leak/TimeWindowAnalyzer.java
+/Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/heap/AllocationClassTransformer.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/core/ThreadSafeCounter.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/util/SystemInfo.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/util/SignalHandler.java
@@ -8,6 +9,7 @@
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/heap/HeapAnalyzer.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/heap/AllocationRecorder.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/report/ReportGenerator.java
+/Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/heap/InstrumentedAllocationRecorder.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/MemoryAnalyzerApp.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/attach/AgentLoader.java
 /Users/zhaojie/develop/workspaceVscode/dump/java-memory-analyzer/src/main/java/com/jvm/analyzer/core/NativeMemoryTracker.java
